@@ -4,17 +4,16 @@ import yt_dlp
 import os
 import sys
 import subprocess
-import re
 from IPython.display import clear_output
 
-youtube_url = 'https://www.youtube.com/live/rLc76TEh3gA'
+# 這裡填入你想下載的 YouTube 影片或 Shorts 網址
+youtube_url = 'https://www.youtube.com/watch?v=xxxxxx' 
 output_dir = '/kaggle/working/'
 
 # ----------------------------------------------------
 # 🔍 自動檢查硬體環境 (是否有可用的 NVIDIA GPU)
 # ----------------------------------------------------
 try:
-    # 嘗試呼叫 nvidia-smi 指令，如果成功代表有 GPU 環境
     subprocess.check_output(['nvidia-smi'])
     has_gpu = True
     device_name = "CUDA / GPU 加速模式"
@@ -25,96 +24,72 @@ except (subprocess.CalledProcessError, FileNotFoundError):
 print(f"🖥️ 偵測到運行環境：{device_name}")
 
 # ----------------------------------------------------
-# 📥 第一階段：yt-dlp 下載回呼函式
+# 📥 第一階段：yt-dlp 下載回呼函式 (用來抓取真實檔名)
 # ----------------------------------------------------
-downloaded_m4a_path = None
-video_duration_seconds = 0
+real_output_path = None  # 用來儲存最終預計生成的檔案路徑
 
 def my_hook(d):
-    global downloaded_m4a_path, video_duration_seconds
+    global real_output_path
     if d['status'] == 'downloading':
+        # 紀錄 yt-dlp 最終要合併輸出的真實完整路徑
+        if 'filename' in d:
+            real_output_path = d['filename']
+            
         clear_output(wait=True)
         print(f"🖥️ 運行環境：{device_name}")
-        print(f"🚀 第一階段：yt-dlp 快速下載中...")
-        print(f" ⏳ [下載中]: {d.get('_percent_str', '0%')} | 速度: {d.get('_speed_str', 'N/A')}")
+        print(f"🚀 正在下載最高畫質影像與音訊中...")
+        print(f" ⏳ [下載中]: {d.get('_percent_str', '0%')} | 速度: {d.get('_speed_str', 'N/A')} | 剩餘時間: {d.get('_eta_str', 'N/A')}")
+        
     elif d['status'] == 'finished':
-        downloaded_m4a_path = d['filename']
-        video_duration_seconds = d.get('info_dict', {}).get('duration', 0)
         clear_output(wait=True)
-        print(f"🚀 第一階段：下載完成！")
+        print(f"🚀 下載完成！正在準備合併/轉碼...")
 
-# 執行下載原生 m4a 格式
+# 動態配置 FFmpeg 合併時的硬體加速參數
+ffmpeg_args = ['-threads', '0'] if has_gpu else ['-threads', 'auto']
+if has_gpu:
+    ffmpeg_args += ['-fflags', '+fastseek+genpts']
+
 ydl_opts = {
-    'format': 'bestaudio[ext=m4a]/bestaudio/best', 
+    'format': 'bestvideo+bestaudio/best',
+    'merge_output_format': 'mp4',
     'outtmpl': os.path.join(output_dir, '%(title)s.%(ext)s'),  
+    
+    # 這裡保留 True 是為了防止下載播放清單時因為一兩部影片壞掉而導致整個程式崩潰
     'ignoreerrors': True,         
     'progress_hooks': [my_hook],  
     'verbose': False,
+    'postprocessor_args': {
+        'ffmpeg': ffmpeg_args,
+        'ffmpeg_i': ffmpeg_args
+    }
 }
 
+print("🚀 啟動最高畫質 MP4 下載任務...")
 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    # 我們可以透過 extract_info 先拿到影片資訊，順便雙重驗證真實檔名
+    try:
+        info = ydl.extract_info(youtube_url, download=False)
+        if info:
+            # 預估最終合併後的 mp4 檔名
+            filename = ydl.prepare_filename(info)
+            real_output_path = os.path.splitext(filename)[0] + '.mp4'
+    except Exception:
+        pass # 如果在解析階段就失敗，交給後面檢查檔案是否存在處理
+        
+    # 正式執行下載
     ydl.download([youtube_url])
 
 # ----------------------------------------------------
-# ⚡ 第二階段：動態配置 FFmpeg 參數並執行轉碼
+# 🚨 第二階段：嚴格檢查檔案是否存在
 # ----------------------------------------------------
-if downloaded_m4a_path and os.path.exists(downloaded_m4a_path):
-    output_mp3_path = os.path.splitext(downloaded_m4a_path)[0] + '.mp3'
-    
-    # 基礎 FFmpeg 指令
-    cmd = ['ffmpeg', '-y']
-    
-    # 根据硬体检测結果，動態注入最佳化參數
-    if has_gpu:
-        # 有 GPU：開啟最大多線程並優化快取時戳定位，加速大檔案讀取
-        cmd += [
-            '-threads', '0', 
-            '-input_format', 'm4a',
-            '-fflags', '+fastseek+genpts'
-        ]
-    else:
-        # 只有 CPU：使用安全的預設多線程
-        cmd += ['-threads', 'auto']
-        
-    # 結合輸入檔案與編碼設定
-    cmd += [
-        '-i', downloaded_m4a_path, 
-        '-acodec', 'libmp3lame', 
-        '-b:a', '192k', 
-        '-progress', 'pipe:1', 
-        '-loglevel', 'quiet', 
-        output_mp3_path
-    ]
-    
-    # 啟動進程
-    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
-    
-    last_percentage = -1
-    for line in process.stdout:
-        if 'time=' in line:
-            time_str = line.split('=')[1].strip()
-            match = re.match(r'(\d+):(\d+):(\d+)', time_str)
-            if match and video_duration_seconds > 0:
-                hours, minutes, seconds = map(int, match.groups())
-                current_seconds = hours * 3600 + minutes * 60 + seconds
-                percentage = min(100, int((current_seconds / video_duration_seconds) * 100))
-                
-                if percentage != last_percentage:
-                    last_percentage = percentage
-                    bar = '█' * (percentage // 5) + '-' * (20 - (percentage // 5))
-                    
-                    clear_output(wait=True)
-                    print(f"🚀 第二階段：FFmpeg 轉碼中 ({device_name})...")
-                    print(f" ⏳ [轉碼中]: |{bar}| {percentage}% ({time_str} / 總長: {video_duration_seconds}秒)")
-                
-    process.wait()
-    
-    # 清理與善後
-    if os.path.exists(output_mp3_path):
-        os.remove(downloaded_m4a_path) # 移除暫存的 m4a 節省 Kaggle 空間
-        clear_output(wait=True)
-        print(f"\n🎉 全部任務完成！在【{device_name}】下成功生成 MP3 檔案！")
-    else:
-        print("\n❌ 轉碼失敗。")
+clear_output(wait=True)
+print(f"🖥️ 運行環境：{device_name}\n")
+
+# 檢查檔案是否真實存在於 Kaggle 的 working 目錄中
+if real_output_path and os.path.exists(real_output_path):
+    print(f"🎉 全部任務完成！已成功在右側生成 MP4 影片！")
+    print(f"📁 檔案路徑: {real_output_path}")
 else:
-    print("\n❌ 下載失敗。")
+    print(f"❌ 下載失敗！")
+    print(f"⚠️ 原因可能為：影片網址錯誤、影片已被刪除、設為私有影片、或需要登入帳號認證。")
+    print(f"💡 建議：請先檢查該 YouTube 網址在瀏覽器是否能正常播放。")
